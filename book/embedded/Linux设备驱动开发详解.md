@@ -838,6 +838,450 @@ udev 可以利用内核通过 netlink 发出的 uevent 信息动态创建设备�
     - 根节点下的默认中断控制器是 `intc`，`intc` 也是根节点下的子节点；
     - [ ] 外部总线与本地总线间的转换、`ranges` 属性的解析、external-bus 下的子节点在 "@" 也使用两个 cell...
 
+## 第十九章-Linux 电源管理的系统架构和驱动
+### Linux 电源管理的全局架构
+- Linux 电源管理牵扯到系统级的待机、频率电压变换、系统空闲时的处理以及每个设备驱动对系统待机的支持和每个设备的运行时（Runtime）电源管理，可以说它和系统中的每个设备驱动都息息相关；
+- 对于消费电子产品来说，电源管理的工作在开发周期中占比相当大；
+- [ ] 图，Linux 内核电源管理的整体架构
+  - CPU 在运行时根据系统负载进行动态电压和频率的变换-CPUFreq
+  - CPU 在系统空闲时根据空闲的情况进行低功耗模式-CPUIdle
+  - 多核系统下 CPU 的热插拔支持；
+  - 系统和设备针对延迟的特别需求而提出申请的 PM QoS (Power Management Quality of Service，表示 Linux 内核电源管理的质量)，它会作用于 CPUIdle 的具体策略；
+  - 设备驱动针对系统挂起到 RAM/硬盘的一系列入口函数；
+  - SoC 进入挂起状态、SDRAM 自刷新的入口；
+  - 设备的运行时动态电源管理，根据使用情况动态开关设备；
+  - 底层的时钟、稳压器、频率/电压表（OPP 模块完成）支撑，各驱动子系统都可能用到；
+
+### CPUFreq 驱动
+- 位于 `drivers/cpufreq` 目录下
+  - 核心层：`drivers/cpufreq/cpufreq.c`，提供各个 SoC 的 CPUFreq 驱动的同一接口、实现 notifier 机制（可在 CPUFreq 的策略和频率改变时向其他模块发出通知）；
+- 负责进行运行过程中 CPU 频率和电压的动态调整，即 DVFS, Dynamic Voltage Frequency Scaling，动态电压频率调整；
+- 降低电压和频率可降低功耗；
+- CPU 运行频率发生变化时，内核的 `loops_per_jiffy` 常数也会发生相应变化；
+
+1. SoC 的 CPUFreq 驱动实现
+   - 只需实现电压、频率表，以及从硬件层面完成这些变化；
+   - 驱动注册接口：
+    ```c
+    int cpufreq_register_driver(struct cpufreq_driver *driver_data);
+
+    struct cpufreq_driver {
+      ...
+    };
+    ```
+    - flags 是一些暗示性标志，如设置了 `CPUFREQ_CONST_LOOPS` 则告诉内核 `loops_per_jiffy` 不会因为 CPU 频率的变化而变化；
+    - init 回调是一个 per-CPU 初始化函数指针，每当一个新的 CPU 被注册进系统时，该函数就被调用。该函数还接受一个 `cpufreq_policy` 的指针参数。在该函数中可以设置 policy 允许的最小、最大频率（单位 Hz）、CPU 进行频率切换所需的延迟（单位 ns）和当前 CPU 频率等；
+    - verify 回调验证用户的 CPUFreq 策略设置有效性和数据修正，每当用户设定新策略时，该函数根据老策略和新策略，检验新策略设置的有效性并对无效设置进行必要的修正；常用到如下辅助函数：
+      ```c
+      cpufreq_verify_within_limits(struct cpufreq_policy *policy, unsigned int min_freq, unsigned int max_freq);
+      ```
+    - setpolicy 回调，实现了该函数的 CPU 一般具备在一个范围里自动调整频率的能力；目前只有少数驱动包含这样的成员函数，而绝大多数 CPU 都不会实现此函数，一般只实现 target 回调；
+    - target 回调，用于将频率调整到一个指定的值；
+    - [ ] 表，setpolicy 和 target 所针对的 CPU 及其调用方式上的区别
+   - 根据芯片内部 PLL 和分频器的关系，ARM SoC 一般不具备独立调整频率的能力，往往 SoC 的 CPUFreq 驱动会提供一个频率表，频率在该表的范围内进行变更，因此一般实现 target 回调；
+   - CPUFreq 核心层提供一组与频率表相关的辅助 API
+    ```c
+    // init 回调的助手，用于将 policy->min 和 policy->max 设置为
+    // 与 cpuinfo.min_freq 和 cpuinfo.max_freq 相同的值
+    int cpufreq_frequency_table_cpuinfo(struct cpufreq_policy *policy, struct cpufreq_frequency_table *table);
+
+    // verify 回调的助手，确保至少有 1 个有效的 CPU 频率位于 policy->min
+    // 到 policy->max 的范围内
+    int cpufreq_frequency_table_verify(struct cpufreq_policy *policy, struct cpufreq_frequency_table *table);
+
+    // target 回调的助手，返回需要设定的频率在频率表中的索引
+    int cpufreq_frequency_table_target(struct cpufreq_policy *policy,
+      struct cpufreq_frequency_table *table,
+      unsigned int target_freq,
+      unsigned int relation,
+      unsigned int *index);
+    ```
+   - 示例程序：`drivers/cpufreq/s3c64xx-cpufreq.c`，具体代码略；
+   - 关于频率表，比较新的内核喜欢使用后面介绍的 OPP。
+
+2. CPUFreq 的策略
+  - SoC CPUFreq 驱动只是设定了 CPU 的频率参数，以及提供了设置频率的途径，但是它并不会管 CPU 自身究竟应该运行在哪种频率上，这些完全由 CPUFreq 的策略（policy）决定；
+  - CPUFreq 的策略：
+    - `cpufreq_ondemand`：平时以低速方式运行，当系统负载提高时按需自动提高频率；
+    - `cpufreq_performance`：以最高频率运行，即 `scaling_max_freq`
+    - `cpufreq_conservative`：传统的、保守的，跟 ondemand 相似，区别在于动态频率在变更的时候采用渐进的方式；
+    - `cpufreq_powersave`：以最低频率运行，即 `scaling_min_freq`；
+    - `cpufreq_userspace`：让用户通过 sys 节点 scaling_setspeed 设置频率
+  - 系统的状态和 CPUFreq 的策略共同决定了 CPU 频率跳变的目标，CPUFreq 核心层并将目标频率传递给底层具体 SoC 的 CPUFreq 驱动，该驱动修改硬件，完成频率的变换：
+    - [ ] 图，CPUFreq、系统负载、策略与调频
+  - 用户空间一般可以 `/sys/devices/system/cpu/cpux/cpufreq` 节点来设置 CPUFreq：
+    ```c
+    echo userspace > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+    echo 700000 > /sys/devices/system/cpu/cpu0/cpufreq/scaling_setspeed
+    ```
+
+3. CPUFreq 的性能测试与调优
+   - cpupower-utils，位于 `tools/power/cpupower`，其中的 cpufreq-bench 工具可以用于分析采用 CPUFreq 后对系统性能的影响；
+   - 一般目标是在采用 CPUFreq 动态调整频率和电压后，性能应该为 performance 这个高性能策略下的 90％ 左右，这样才比较理想。
+
+4. CPUFreq 通知
+   - CPUFreq 子系统发出通知的两种情况：
+     - CPUFreq 的策略变化
+     - CPU 运行频率变化
+   - 在策略变化的过程中，会发送 3 次通知：
+     - `CPUFREQ_ADJUST`
+     - `CPUFREQ_INCOMPATIBLE`
+     - `CPUFREQ_NOTIFY`
+   - 在频率变化的过程中，会发送 2 次通知：
+     - `CPUFREQ_PRECHANGE`
+     - `CPUFREQ_POSTCHANGE`
+     - 发送示例：
+      ```c
+      // freqs 为 cpufreq_freqs 的结构体，包含 cpu (CPU 号)、old（过去的频率）和 new（现在的频率）
+      srcu_notifier_call_chain(&cpufreq_transition_notifier_list, CPUFREQ_PRECHANGE, freqs);
+      srcu_notifier_call_chain(&cpufreq_transition_notifier_list, CPUFREQ_POSTCHANGE, freqs);
+      ```
+   - 注册 notifier 示例：`drivers/video/sa1100fb.c`，接口：`cpufreq_register_notifier(...)`；
+   - 如果在系统挂起/恢复过程中 CPU 频率发生了变化，则 CPUFreq 子系统也会发出 `CPUFREQ_SUSPENDCHANGE` 和 `CPUFREQ_RESUMECHANGE` 这两个通知；
+   - 除了 CPU 以外，一些设备也支持操作频率和电压，存在多个 OPP。Linux 3.2 以后的内核也支持针对这种非 CPU 设备的 DVFS，该套子系统为 Devfreq，位置：`drivers/devfreq`。
+
+### CPUIdle 驱动
+- ARM SoC 大多支持几个不同的 Idle 级别，CPUIdle 驱动子系统存在的目的就是对这些 Idle 状态进行管理，并根据系统的运行情况进入不同的 Idle 级别。
+- 具体 SoC 的底层 CPUIdle 驱动实现则提供一个类似于 CPUFreq 驱动频率表的 Idle 级别表，并实现各种不同 Idle 状态的进入和退出流程。
+- Intel，支持 ACPI，Advanced Configuration and Power Interface，一般有 4 个不同的 C 状态（C0-操作状态、C1-Halt 状态、C2-Stop-clock 状态、C3-Sleep 状态）。
+- ARM SoC 对 Idle 的实现方法差异比较大，最简单的 Idle 级别莫过于将 CPU 核置于 WFI (等待中断发生) 状态，因此在默认情况下，若 SoC 未实现自身的芯片级 CPUIdle 驱动，则会进入 `cpu_do_idle()`。对于 ARMv7 而言，其实现位于 `arch/arm/mm/proc-v7.S`:
+  ```asm
+  ENTRY(cpu_v7_do_idle)
+  dsb                     @ WFI may enter a low-power mode
+  wfi
+  mov pc, lr
+  ENDPROC(cpu_v7_do_idle)
+  ```
+- 注册 API：
+  ```c
+  int cpuidle_register_driver(struct cpuidle_driver *drv);
+  int cpuidle_register_device(struct cpuidle_device *dev);
+
+  struct cpuidle_driver {
+    ...
+  }
+
+  struct cpuidle_state {
+    ...
+  }
+  ```
+  - CPUIdle 驱动必须针对每个 CPU 注册相应的 cpuidle_device，这意味着对于多核 CPU 而言，需要针对每个 CPU 注册依次；
+- 驱动示例：`arch/arm/mach-ux500/cpuidle.c`/`drivers/cpuidle/cpuidle-ux500.c`，它有两个 Idle 级别，WFI 和 ApIdle。
+- governor：
+  - `CPU_IDLE_GOV_LADDER`：在进入和退出 Idle 级别时是步进的，它以过去的 Idle 时间作为参考，适用于没有采用动态时间节拍的系统（没有选择 `NO_HZ`）；
+  - `CPU_IDLE_GOV_MENU`：总是根据预期的空闲时间直接进入目标 Idle 级别，依赖于内核的 `NO_HZ` 选项；
+- 在 sys 导出的节点
+  - 针对整个系统的 `/sys/devices/system/cpu/cpuidle`，通过其中的 `current_driver, current_governor, available_governors` 等节点获取或设置 CPUIdle 的驱动信息以及 governor；
+  - 针对每个 CPU 的 `sys/devices/system/cpu/cpux/cpuidle`，通过子节点暴露各个在线的 CPU 中每个不同 Idle 级别的 name、desc、power、latency 等信息；
+- [ ] 图，Linux CPUIdle 子系统的整体框架
+
+### PowerTop
+- 一款开源的用于进行电量消耗分析和电源管理诊断的工具
+
+### Regulator 驱动
+- Regulator 是 Linux 系统中电源管理的基础设施之一，用于稳压电源的管理，是各种驱动子系统中设置电源的标准接口。
+- Regulator 可以管理系统中的供电单元，即稳压器（LDO, Low Dropout Regulator，即低压差线性稳压器），并提供获取和设置这些供电单元电源的接口。
+- 一般在 ARM 电路板上，各个稳压器和设备会形成一个 Regulator 树形结构：
+  - [ ] 图，Regulator 树形结构
+- 注册和注销接口：
+  ```c
+  struct regulator_dev *regulator_register(const struct regulator_desc *regulator_desc, const struct regulator_config *config);
+
+  void regulator_unregister(struct regulator_dev *rdev);
+
+  // regulator_dev 对稳压器属性和操作的封装
+  struct regulator_dev {
+    ...
+  }
+  // regulator_ops 对稳压器硬件操作的封装
+  struct regulator_ops {
+    ...
+  }
+  ```
+- 在 `drivers/regulator` 下，包含大量的 regulator 驱动，同时提供了一个虚拟的 regulator 驱动作为参考；
+- Regulator 子系统提供 Consumer API：
+  ```c
+  struct regulator *regulator_get(struct device *dev, const char *id);
+  struct regulator *devm_regulator_get(struct device *dev, const char *id);
+  struct regulator *regulator_get_exclusive(struct device *dev, const char *id);
+  void regulator_put(struct regulator *regulator);
+  void devm_regulator_put(struct regulator *regulator);
+  int regulator_enable(struct regulator *regulator);
+  int regulator_disable(struct regulator *regulator);
+  int regulator_set_voltage(struct regulator *regulator, int min_uV, int max_uV);
+  int regulator_get_voltage(struct regulator *regulator);
+  ```
+
+### OPP
+- 在 SoC 内，某些 domain 可以运行在较低的频率和电压下，而其他 domain 可以运行在较高的频率和电压下，某个 domain 所支持的 <频率，电压> 对的集合被称为 Operating Performance Point，简称 OPP。
+- 针对与 device 结构体指针 dev 对应的 domain 中增加一个新的 OPP：
+  ```c
+  int opp_add(struct device *dev, unsigned long freq, unsigned long u_volt);
+  ```
+- 使能和禁止某个 OPP：
+  ```c
+  int opp_enable(struct device *dev, unsigned long freq);
+  int opp_disable(struct device *dev, unsigend long freq);
+  ```
+  - 一旦被禁止，其 available 将成为 false
+- 寻找一个确定频率和 available 匹配的 OPP：
+  ```c
+  struct opp *opp_find_freq_exact(struct device *dev, unsigned long freq, bool available);
+  // 变体-频率向下接近或等于指定的频率
+  struct opp *opp_find_freq_floor(struct device *dev, unsigned long *freq);
+  // 变体-频率向上接近或等于指定的频率
+  struct opp *opp_find_freq_ceil(struct device *dev, unsigned long *freq);
+  ```
+- 在频率降低的同时，支持该频率运行所需的电压也往往可以动态调低；反之同理：
+  ```c
+  // 获取与某 opp 对应的电压和频率
+  unsigned long opp_get_voltage(struct opp *opp);
+  unsigned long opp_get_freq(struct opp *opp);
+
+  // 示例：
+  soc_switch_to_freq_voltage(freq) {
+    // do things
+    rcu_read_lock();
+    opp = opp_find_freq_ceil(dev, &freq);
+    v = opp_get_voltage(opp);
+    rcu_read_unlock();
+    if (v)
+      regulator_set_voltage(..., v);
+    // do other things
+  }
+  ```
+- 获取设备所支持的 OPP 的个数：
+  ```c
+  int opp_get_opp_count(struct device *dev);
+  ```
+- TI OMAP CPUFreq 驱动的底层就使用了 OPP 这种机制来获取 CPU 所支持的频率和电压列表。在开机过程中，TI OMAP4 芯片会注册针对 CPU 设备的 OPP 表（`arch/arm/mach-omap2/` 中）。
+  - 在 `omap_init_opp_table()` 中添加了相应的 OPP；
+  - 在 TI OMAP 芯片的 CPUFreq 驱动 `drivers/cpufreq/omap-cpufreq.c` 中，借助 `opp_init_cpufreq_table()` 并根据前面注册的 OPP 建立 CPUFreq 的频率表；
+  - 在 CPUFreq 的 target 回调函数实现 `omap_target()` 中使用与 OPP 相关的 API 来获取频率和电压；
+- 比较新的驱动一般不太喜欢直接在代码里面固化 OPP 表，而是喜欢在相应的节点处添加 `operating-points` 属性，如 `imx27.dtsi` 中：
+  ```c
+  cpus {
+    #size-cells = <0>;
+    #address-cells = <1>;
+
+    cpu: @cpu0 {
+      device_type = "cpu";
+      compatible = "arm,arm926ej-s";
+      operating-points = <
+        /* KHz uv */
+        266000 1300000
+        399000 1450000
+      >;
+      clock-latency = <62500>;
+      clocks = <&clks, IMX27_CLK_CPU_DIV>;
+      voltage-tolerance = <5>;
+    };
+  };
+  ```
+- 如果 CPUFreq 的变化可以使用非常标准的 regulator、clk API，我们甚至可以直接使用 `drivers/cpufreq/cpufreq-dt.c` 这个驱动。这样只需要在 CPU 节点上填充好频率电压表，然后在平台代码里面注册 cpufreq-dt 设备就可以了。在 `arch/arm/mach-imx/imx27-dt.c`、`arch/arm/mach-imx/mach-imx51.c` 中可以找到类似的例子：
+  ```c
+  static void __init imx27_dt_init(void) {
+    struct platform_device_info devinfo = {
+      .name = "cpufreq-dt",
+    };
+    of_platform_populate(NULL, of_default_bus_match_table, NULL, NULL);
+    platform_device_register_full(&devinfo);
+  }
+  ```
+
+### PM QoS
+- Linux 内核的 PM QoS 系统针对内核和应用程序提供了一套接口，通过这个接口，用户可以设定自身对性能的期望。
+  - 一类是系统级的需求，通过 `cpu_dma_latency`、`network_latency` 和 `network_throughput` 这些参数来设定；
+  - 另一类是单个设备可以根据自身的性能需求发起 `per-device` 的 PM QoS 请求。
+- PM QoS 接口：
+  ```c
+  // 注册请求
+  void pm_qos_add_request(struct pm_qos_request *req, int pm_qos_class, s32 value);
+  // 更新已注册的请求
+  void pm_qos_update_request(struct pm_qos_request *req, s32 new_value);
+  void pm_qos_update_request_timeout(struct pm_qos_request *req, s32 new_value, unsigned long timeout_us);
+  // 删除已注册的请求
+  void pm_qos_remove_request(struct pm_qos_request *req);
+  ```
+- 示例：在 `/drivers/media/platform/via-camera.c` 这个摄像头驱动中：
+  ```c
+  // 当摄像头开启后，通过如下方式阻止 CPU 进入 C3 级别深度的 Idle：
+  static int viacam_streamon(struct file *filp, void *priv, enum v4l2_buf_type t) {
+    ...
+    pm_qos_add_request(&cam->qos_request, PM_QOS_CPU_DMA_LATENCY, 50);
+  }
+
+  // 当摄像头关闭后，取消对 PM_QOS_CPU_DMA_LATENCY 的性能要求
+  static int viacam_streamon(struct file *filp, void *priv, enum v4l2_buf_type t) {
+    ...
+    pm_qos_remove_request(&cam->qos_request);
+    ...
+  }
+  ```
+  - 类似的在设备驱动中申请 QoS 特性的例子还包括：`drivers/net/wireless/ipw2x00/ipw2100.c`、`drivers/tty/serial/omap-serial.c`、`drivers/net/ethernet/intel/e1000e/netdev.c` 等；
+  - 在 CPUIdle 子系统中，会根据 `PM_QOS_CPU_DMA_LATENCY` 请求情况选择合适的 C 状态；
+  - `drivers/cpuidle/governors/ladder.c` 中的 `ladder_select_state()` 会判断目标 C 状态的 `exit_latency` 与 QoS 要求的关系，具体代码略。LADDER 在选择是否进入更深层次的 C 状态时，会比较 C 状态的 exit_latency 要小于通过 `pm_qos_request(PM_QOS_CPU_DMA_LATENCY)` 得到的 PM QoS 请求的延迟。同样的逻辑也出现在 `drivers/cpuidle/governors/menu.c` 中。
+- 应用程序则可以通过向 `/dev/cpu_dma_latency` 和 `/dev/network_latency` 这样的设备节点写入值来发起 QoS 的性能请求。
+
+### CPU 热插拔
+- Linux 3.8 之后的内核 CPU0 也可以热插拔；
+- 一般地，在用户空间可以通过 `/sys/devices/system/cpu/cpun/online` 节点来操作一个 CPU 的在线和离线：
+  ```bash
+  # xxx -> 离线
+  echo 0 > /sys/devices/system/cpu/cpu3/online
+  # xxx -> 在线
+  echo 1 > /sys/devices/system/cpu/cpu3/online
+  ```
+- 在 CPU 离线时，该 CPU 上的进程都会被迁移到其他 CPU 上，以保证拔除该 CPU 的过程中，系统仍然能正常运行。当 CPU 再次在线时，又可以参与系统的负载均衡，分担系统中的任务。
+- 在嵌入式系统中，CPU 热插拔可以作为一种省电的方式。在系统负载小时，动态关闭 CPU，当负载增大后再开启之前离线的 CPU。
+- 目前各个芯片公司可能会根据自身 SoC 的特点，对内核进行调整，来实现运行时“热插拔”。
+- 关于运行时热插拔的示例，Tegra3 vSMP，5 个 Cortex-A9 处理器，其中 4 个为高性能 G 核，1 个 为低功耗 LP 核，具体示例略。
+- 目前，ARM 和 Linux 社区都在从事关于 big.LITTLE 架构下，CPU 热插拔以及调度器方面有针对性的改进工作。在 big.LITTLE 架构中，将高性能且功耗也较高的 Cortex-A15 和稍低性能且功耗低的 Cortex-A7 进行了结合，或者在 64 位下，进行 Cortex-A57 和 Cortex-A53 的组合：
+  - [ ] 图，ARM 的 big.LITTLE 架构
+- big.LITTLE 架构的设计旨在为适当的作业分配恰当的处理器。Cortex-A15 处理器是目前已开发的性能最高的低功耗 ARM 处理器，而 Cortex-A7 处理器是目前已开发的最节能的 ARM 应用程序处理器。可以利用 Cortex-A15 处理器的性能来承担繁重的工作负载，而用 Cortex-A7 可以最有效地处理智能手机的大部分工作负载，包括操作系统活动、用户界面和其他持续运行、始终连接的任务。
+
+### 挂起到 RAM
+- Linux 支持 STANDBY、挂起到 RAM、挂起到硬盘等形式的待机；
+  - [ ] 图，Linux 的待机模式
+  - 挂起到 RAM：即将系统的状态保存于内存中，并将 SDRAM 置于自刷新状态，待用户按键等操作后再重新恢复系统；
+  - 挂起到硬盘：简称 STD，与挂起到 RAM 不同的是，后者并不关机，STD 则把系统的状态保持于磁盘，然后关闭整个系统。
+- 一般的嵌入式产品仅仅只实现了挂起到 RAM，简称 s2ram 或 STR；
+- 在 Linux 下，这些行为通常是由用户空间触发的，通过向 `/sys/power/state` 写入 `mem` 可开始挂起到 RAM 的流程。许多 Linux 产品会有一个按键，通过按键挂起到 RAM，这通常是由于与这个按键对应的输入设备驱动汇报了一个和电源相关的 input_event，用户空间的电源管理 daemon 进程收到这个事件后，再触发 s2ram。
+- 内核也有一个 INPUT_APMPOWER 驱动，位于 `drivers/input/apm-power.c` 下，它可以在内核级别侦听 `EV_PWR` 类事件，并通过 `apm_queue_event(APM_USER_SUSPEND)` 自动引发 s2ram：
+  ```c
+  static void system_power_event(unsigned ing keycode) {
+    switch (keycode) {
+    case KEY_SUSPEND:
+      amp_queue_event(APM_USER_SUSPEND);
+      pr_info("Requesting system suspend...\n");
+      break;
+    default:
+      break;
+    }
+  }
+
+  static void apmpower_event(struct input_handle *handle, unsigned int type, unsigned int code, int value) {
+    ...
+    switch (type) {
+    case EV_PWR:
+      system_power_event(code);
+      break;
+    ...
+    }
+  }
+  ```
+- 在 Linux 内核中，挂起到 RAM 的挂起和恢复流程牵涉的操作包括同步文件系统、freeze 进程、设备驱动挂起以及系统的挂起入口：
+  - [ ] 图，Linux 挂起到 RAM 流程
+- 在 Linux 内核的 device_driver 结构中，含有一个 pm 成员，它是一个 dev_pm_ops 结构体指针，在该结构体中，封装了挂起到 RAM 和挂起到硬盘所需的回调函数。`struct dev_pm_ops` 定义略。
+  - 目前比较推荐的做法是在 platform_driver、i2c_driver 和 spi_driver 等 xxx_driver 结构体实例的 driver 成员中，通过 `dev_pm_ops` 封装 PM 回调函数，并赋值到 driver 的 pm 字段。如 `drivers/spi/spi-s3c64xx.c` 中 `platform_driver` 的 `pm` 成员被赋值，具体代码略。`s3c64xx_spi_suspend()` 完成了时钟的禁止、`s3c64xx_spi_resume()` 则完成了硬件的重新初始化、时钟的使能等工作。
+- 在 platform_driver、i2c_driver、spi_driver 等 xxx_driver 结构体中仍然保留了过程（legacy）的 suspend、resume 入口函数，目前不再推荐使用过时的接口，而是推荐赋值 xxx_driver 中的 driver 的 pm 成员；
+  - 在 Linux 的核心层中，实际上是优先选择执行 `xxx_driver.driver.pm.suspend()`，当接口不存在时，执行 `xxx_driver.suspend()`，如 `platform_pm_suspend()`：
+    ```c
+    int platform_pm_suspend(struct device *dev) {
+      struct device_driver *drv = dev->driver;
+      int ret = 0;
+
+      if (!drv)
+        return 0;
+      
+      if (drv->pm) {
+        if (drv->pm->suspend)
+          ret = drv->pm->suspend(dev);
+      } else {
+        ret = platform_legacy_suspend(dev, PMSG_SUSPEND);
+      }
+      return ret;
+    }
+    ```
+  - [ ] xxx_driver 和 driver 以及 device 的 pm 操作的作用、联系和区别
+- 一般来讲，在设备驱动的挂起入口函数中，会关闭设备、关闭该设备的时钟输入，甚至是关闭设备的电源，在恢复时完成相反的操作。
+- 在挂起到 RAM 的挂起和恢复过程中，系统恢复后要求所有设备的驱动都工作正常。为了调试这个过程，可以使能内存的 `PM_DEBUG` 选项，如果想在挂起和恢复过程中，看到内核的打印信息，可以在 Bootloader 传递给内核的 bootargs 中设置标志 no_console_suspend。
+- 在将 Linux 移植到一个新的 ARM SoC 的过程中，最终系统挂起的入口需由芯片供应商在相应的 `arch/arm/mach-xxx` 中实现 `platform_suspend_ops` 的成员函数，一般主要实现其中的 enter 和 valid 成员，并将整个 platform_suspend_ops 结构体通过内核通用 API `suspend_set_ops()` 注册进系统，如 `arch/arm/mach-prima2/pm.c` 中 prima2 SoC 级挂起流程，代码略。
+
+### 运行时的 PM
+- 在 `dev_pm_ops` 结构体中，以 `runtime` 开头的成员函数：`runtime_suspend()`、`runtime_resume()`、`runtime_idle()`，它们辅助设备完成运行时的电源管理。
+- 运行时的 PM 与系统级挂起到 RAM 时的 PM 不太一样，它是针对单个设备，指系统在非睡眠状态下的情况，某个设备在空闲时可以进入运行时挂起状态，而在不是空闲时执行运行时恢复使得设备进入正常工作状态。如此，达到运行时省电的目的。
+- 相关 API：
+  ```c
+  // 引发设备的挂起，执行相关的 runtime_suspend 函数
+  int pm_runtime_suspend(struct device *dev);
+  // “调度”设备的挂起，延迟 delay ms 后将挂起工作挂入 pm_wq 等待队列
+  // 结果等价于 delay ms 后执行相关的 runtime_suspend()
+  int pm_schedule_suspend(struct device *dev, unsigned int delay);
+  // “调度”设备的挂起，自动挂起的延迟到后，挂起的工作项目被自动放入队列
+  int pm_request_autosuspend(struct device *dev);
+  // 引发设备的恢复，执行相关的 runtime_resume() 函数
+  int pm_runtime_resume(struct device *dev);
+  // 发起一个设备恢复的请求，该请求也是挂入 pm_wq 等待队列
+  int pm_request_resume(struct device *dev);
+  // 引发设备的空闲，执行相关的 runtime_idle() 函数
+  int pm_runtime_idle(struct device *dev);
+  // 发起一个设备空闲的请求，该请求也是挂入 pm_wq 等待队列
+  int pm_request_idle(struct device *dev);
+  // 使能设备的运行时 PM 支持
+  void pm_runtime_enable(struct device *dev);
+  // 禁止设备的运行时 PM 支持
+  int pm_runtime_disable(struct device *dev);
+  // 增加设备的引用计数（usage_count），类似于 clk_get()，会间接引发设备的 runtime_resume()
+  int pm_runtime_get(struct device *dev);
+  int pm_runtime_get_sync(struct device *dev);
+  // ... clk_put，... runtime_idle()
+  int pm_runtime_put(struct device *dev);
+  int pm_runtime_put_sync(struct device *dev);
+  ```
+- 对 Linux 运行时 PM 机制的简单理解：每个设备（总线的控制器自身也是设备）都有引用计数 usage_count 和活跃子设备（Active Children）计数 child_count，当两个计数都为 0 时，就进入空闲状态，调用 `pm_request_ilde(dev)`。当设备进入空闲状态，与 `pm_request_idle(dev)` 对应的 PM 核并不一定直接调用设备驱动的 `runtime_suspend()`，它实际上在多数情况下是调用与该设备对应的 `bus_type` 的 `runtime_suspend()`：
+  ```c
+  static pm_callback_t __rmp_get_callback(struct device *dev, size_t cb_offset) {
+    pm_callback_t cb;
+    const struct dev_pm_ops *ops;
+
+    if (dev->pm_domain)
+      ops = &dev->pm_domain->ops;
+    else if (dev->type && dev->type->pm)
+      ops = dev->type->pm;
+    else if (dev->class && dev->class->pm)
+      ops = dev->class->pm;
+    else if (dev->bus && dev->bus->pm)
+      ops = dev->bus->pm;
+    else
+      ops = NULL;
+    
+    if (ops)
+      cb = *(pm_callback_t*)((void*)dev->driver->pm + cb_offset);
+    return cb; 
+  }
+  ```
+  - bus_type 级的回调函数实际上可以被 pm_domain、type、class 覆盖掉，这些都统称为子系统；
+  - bus_type 等子系统级别的 runtime_idle() 行为完全由相应的总线类型、设备分类和 pm_domain 因素决定，但是一般的行为是子系统级别的 runtime_idle() 会调度设备驱动的 runtime_suspend()。
+- 在具体的设备驱动中，一般用法是在设备驱动 `probe()` 时运行 `pm_runtime_enable()` 使能运行时 PM 支持，在运行过程中动态地执行 `pm_runtime_get_xxx()->do work -> pm_runtime_put_xxx()` 的序列。示例代码：`/drivers/watchdog/omap_wdt.c-omap_wdt_start(), omap_wdt_stop()`。
+- 在某些设备驱动中，直接使用引用计数的方法进行挂起、空闲和恢复不一定合适，因为挂起状态的进入和恢复需要一些时间，如果设备不在挂起之间保留一定的时间，频繁进出挂起反而会带来新的开销。因此，可根据实际情况决定只有设备在空闲了一段时间后才进入挂起（一般来说，一个一段时间没有被使用的设备，还会有一段时间不会被使用）。基于此，一些设备驱动也常常使用自动挂起模式进行编程。
+  - 在执行操作的声明 `pm_runtime_get()`，操作完成后执行 `pm_runtime_mark_last_busy()` 和 `pm_runtime_put_autosuspend()`，一旦自动挂起的延时到期且设备的使用计数为 0，则引发相关的 `runtime_suspend()` 入口函数的调用：
+    ```c
+    foo_read_or_write(struct foo_priv *foo, void *data) {
+      lock(&foo->private_lock);
+      add_request_to_io_queue(foo, data);
+      if (foo->num_pending_request++ == 0)
+        pm_runtime_get(&foo->dev);
+      if (!foo->is_suspend)
+        foo_process_next_request(foo);
+      unlock(&foo->private_lock);
+    }
+
+    foo_io_completion(struct foo_priv *foo, void *req) {
+      lock(&foo->private_lock);
+      if (--foo->num_pending_request == 0) {
+        pm_runtime_mark_last_busy(&foo->dev);
+        pm_runtime_put_autosuspend(&foo->dev);
+      } else {
+        foo_process_next_request(foo);
+      }
+      unlock(&foo->private_lock);
+      // 将请求结果返回给用户...
+    }
+    ```
+  - [ ] 挂起和空闲的区别是什么，为什么上述在 ilde 时要调用 suspend，是不是书本错误？
+- 设备驱动 PM 成员的 `runtime_suspend()` 一般完成保存上下文、切到省电模式的工作，而 `runtime_resume()` 一般完成对硬件上电、恢复上下文的工作。示例程序：`drivers/spi/spi-p1022.c`。
+
 ## 第二十章 Linux 芯片级移植及底层驱动
 ### ARM Linux 底层驱动的组成和现状
 - 为了让 Linux 在一个全新的 ARM SoC上运行，需要提供大量的底层支撑，如定时器节拍、中断控制器、SMP 启动、CPU 热插拔以及底层的 GPIO、时钟、pinctrl 和 DMA 硬件的封装等。
